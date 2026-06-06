@@ -1,0 +1,21 @@
+version: '3'
+
+tasks:
+  test:
+    desc: Run all Go tests (race)
+    cmds:
+      - go test ./... -race
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  check:
+    desc: vet + test
+    deps: [vet, test]
+
+  tidy:
+    desc: go mod tidy
+    cmds:
+      - go mod tidy
