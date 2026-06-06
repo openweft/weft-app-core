@@ -32,40 +32,125 @@ const (
 	WireGuard TransportKind = "wireguard"
 )
 
-// EndpointConfig describes one datacenter, in priority order within
-// Config.Endpoints (index 0 = most preferred).
-type EndpointConfig struct {
-	Name string        `json:"name"`
-	// DisplayName is the operator-facing label (Topbar chip, menubar
-	// title, tray submenu). Falls back to Name when empty — most ops
-	// keep them aligned, but ones who'd rather see "Paris" than
-	// "DC-EU-1" can override here without renaming the technical ID
-	// that flows into logs and known-hosts entries.
+// ClusterConfig is one weft cluster — a single etcd quorum. Its `dcs`
+// are the (typically 3) machine rooms that host the etcd peers ;
+// they're close enough (sub-millisecond RTT, same metro / 100GbE
+// backbone) that the raft consensus is healthy and the failover
+// Supervisor probes between them transparently. Crossing a WAN (>5ms
+// RTT) means a SECOND cluster, not another DC — that's federation,
+// not failover.
+type ClusterConfig struct {
+	// Name is the technical cluster ID — propagated to logs, metrics,
+	// known-hosts. Lowercase kebab convention : "paris", "tokyo".
+	Name string `json:"name"`
+	// DisplayName is the operator-facing label (menubar title, chip).
+	// Falls back to Name when empty. "Paris", "Tokyo".
 	DisplayName string `json:"display_name,omitempty"`
+	// DCs are the rooms / racks inside the cluster. Failover picks
+	// across them ; the first index is most preferred.
+	DCs []DCConfig `json:"dcs"`
+}
 
-	Kind TransportKind `json:"kind"`
+// DCConfig describes one datacenter (machine room / rack) inside a
+// ClusterConfig. The transport fields mirror the legacy
+// EndpointConfig — only the surrounding shape changed.
+type DCConfig struct {
+	Name        string        `json:"name"`
+	DisplayName string        `json:"display_name,omitempty"`
+	Kind        TransportKind `json:"kind"`
 
 	// Direct / WireGuard: the webui listener address "host:port".
 	Addr string `json:"addr,omitempty"`
 
 	// SSH transport fields.
-	SSHAddr        string `json:"ssh_addr,omitempty"`         // "host:22"
-	User           string `json:"user,omitempty"`             // SSH user (default $USER)
-	KeyPath        string `json:"key_path,omitempty"`         // PEM private key
-	KnownHostsPath string `json:"known_hosts_path,omitempty"` // host verification
-	WebUIAddr      string `json:"webui_addr,omitempty"`       // webui addr seen from SSH host
+	SSHAddr        string `json:"ssh_addr,omitempty"`
+	User           string `json:"user,omitempty"`
+	KeyPath        string `json:"key_path,omitempty"`
+	KnownHostsPath string `json:"known_hosts_path,omitempty"`
+	WebUIAddr      string `json:"webui_addr,omitempty"`
+}
+
+// EndpointConfig is the legacy single-DC shape (no cluster grouping).
+// Loaded when app.json declares `endpoints[]` instead of `clusters[]`
+// ; wrapped into a single auto-named ClusterConfig at load time so the
+// rest of the pipeline only sees the new shape. New configs SHOULD
+// use clusters[] ; this stays as a backward-compat shim.
+type EndpointConfig struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name,omitempty"`
+
+	Kind TransportKind `json:"kind"`
+
+	Addr string `json:"addr,omitempty"`
+
+	SSHAddr        string `json:"ssh_addr,omitempty"`
+	User           string `json:"user,omitempty"`
+	KeyPath        string `json:"key_path,omitempty"`
+	KnownHostsPath string `json:"known_hosts_path,omitempty"`
+	WebUIAddr      string `json:"webui_addr,omitempty"`
 }
 
 // Config is the app's connection configuration, typically loaded from
-// JSON next to the binary or discovered via DNS at startup.
+// JSON next to the binary or discovered via DNS at startup. The
+// canonical shape is `clusters[]` with nested `dcs[]` ; the legacy
+// `endpoints[]` shape is still accepted and wrapped into a single
+// cluster at load time.
 type Config struct {
-	Endpoints []EndpointConfig `json:"endpoints"`
+	// Clusters is the new shape : one entry per etcd quorum, each
+	// with its own DCs[]. Failover lives within a cluster ; switching
+	// between clusters is operator-driven (federation territory).
+	Clusters []ClusterConfig `json:"clusters,omitempty"`
+	// Endpoints is the legacy flat shape, kept for backward
+	// compatibility. When set, it's auto-wrapped into a single cluster.
+	// Deprecated : use Clusters[] in new configs.
+	Endpoints []EndpointConfig `json:"endpoints,omitempty"`
 	// GatewayAddr is the loopback bind for the WebView origin. Default
 	// "127.0.0.1:0" (OS-assigned port).
 	GatewayAddr string `json:"gateway_addr,omitempty"`
 	// Interval / HoldDown tune the Supervisor; zero -> package defaults.
 	Interval time.Duration `json:"interval,omitempty"`
 	HoldDown time.Duration `json:"hold_down,omitempty"`
+}
+
+// EachDC iterates every DC across every cluster, in declaration
+// order, calling fn with the parent cluster + dc + global index.
+// Used by New() to flatten the nested shape into the supervisor's
+// flat endpoint list.
+func (c Config) EachDC(fn func(cluster ClusterConfig, dc DCConfig, idx int)) {
+	idx := 0
+	for _, cl := range c.normalisedClusters() {
+		for _, dc := range cl.DCs {
+			fn(cl, dc, idx)
+			idx++
+		}
+	}
+}
+
+// normalisedClusters returns the cluster list after merging the
+// legacy Endpoints[] into a single auto-named cluster ("default"
+// when no Clusters[] is present, no-op otherwise). Mutating the
+// returned slice is safe — it's a copy.
+func (c Config) normalisedClusters() []ClusterConfig {
+	if len(c.Endpoints) == 0 {
+		out := make([]ClusterConfig, len(c.Clusters))
+		copy(out, c.Clusters)
+		return out
+	}
+	// Legacy : wrap endpoints in a default cluster. If Clusters[] is
+	// also set, concatenate — but document this is unusual.
+	wrapped := ClusterConfig{Name: "default"}
+	for _, ep := range c.Endpoints {
+		wrapped.DCs = append(wrapped.DCs, DCConfig{
+			Name: ep.Name, DisplayName: ep.DisplayName, Kind: ep.Kind,
+			Addr: ep.Addr, SSHAddr: ep.SSHAddr, User: ep.User,
+			KeyPath: ep.KeyPath, KnownHostsPath: ep.KnownHostsPath,
+			WebUIAddr: ep.WebUIAddr,
+		})
+	}
+	if len(c.Clusters) == 0 {
+		return []ClusterConfig{wrapped}
+	}
+	return append([]ClusterConfig{wrapped}, c.Clusters...)
 }
 
 // LoadConfig reads a JSON Config from path. Accepts the duration fields
@@ -80,6 +165,7 @@ func LoadConfig(path string) (Config, error) {
 		return cfg, fmt.Errorf("read config %s: %w", path, err)
 	}
 	type shadow struct {
+		Clusters    []ClusterConfig  `json:"clusters"`
 		Endpoints   []EndpointConfig `json:"endpoints"`
 		GatewayAddr string           `json:"gateway_addr,omitempty"`
 		Interval    json.RawMessage  `json:"interval,omitempty"`
@@ -89,6 +175,7 @@ func LoadConfig(path string) (Config, error) {
 	if err := json.Unmarshal(b, &sh); err != nil {
 		return cfg, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	cfg.Clusters = sh.Clusters
 	cfg.Endpoints = sh.Endpoints
 	cfg.GatewayAddr = sh.GatewayAddr
 	if d, err := decodeDuration(sh.Interval); err != nil {
@@ -154,17 +241,37 @@ type Shell struct {
 
 // New builds the backends, supervisor and gateway from cfg. It does not
 // start probing or accepting — call Run.
+//
+// Accepts both the new clusters[].dcs[] shape and the legacy
+// endpoints[] shape (auto-wrapped into a single "default" cluster by
+// Config.normalisedClusters).
 func New(cfg Config, opts Options) (*Shell, error) {
-	if len(cfg.Endpoints) == 0 {
-		return nil, fmt.Errorf("shell: no endpoints configured")
+	clusters := cfg.normalisedClusters()
+	if len(clusters) == 0 {
+		return nil, fmt.Errorf("shell: no clusters or endpoints configured")
 	}
-	eps := make([]transport.Endpoint, 0, len(cfg.Endpoints))
-	for _, ec := range cfg.Endpoints {
-		b, err := buildBackend(ec, opts)
-		if err != nil {
-			return nil, fmt.Errorf("endpoint %q: %w", ec.Name, err)
+	var eps []transport.Endpoint
+	for _, cl := range clusters {
+		if len(cl.DCs) == 0 {
+			return nil, fmt.Errorf("shell: cluster %q has no dcs", cl.Name)
 		}
-		eps = append(eps, transport.Endpoint{Name: ec.Name, DisplayName: ec.DisplayName, Backend: b})
+		clusterLabel := cl.DisplayName
+		if clusterLabel == "" {
+			clusterLabel = cl.Name
+		}
+		for _, dc := range cl.DCs {
+			b, err := buildBackend(dcToLegacy(dc), opts)
+			if err != nil {
+				return nil, fmt.Errorf("cluster %q dc %q: %w", cl.Name, dc.Name, err)
+			}
+			eps = append(eps, transport.Endpoint{
+				Name:         dc.Name,
+				DisplayName:  dc.DisplayName,
+				Cluster:      cl.Name,
+				ClusterLabel: clusterLabel,
+				Backend:      b,
+			})
+		}
 	}
 
 	sup := failover.New(eps, failover.Options{
@@ -177,6 +284,18 @@ func New(cfg Config, opts Options) (*Shell, error) {
 		return nil, err
 	}
 	return &Shell{sup: sup, gw: gw, authToken: opts.AuthToken}, nil
+}
+
+// dcToLegacy converts the new DCConfig to the legacy EndpointConfig
+// shape buildBackend expects. Mechanical field-for-field copy ; kept
+// as a one-liner so buildBackend isn't churned by the rename.
+func dcToLegacy(dc DCConfig) EndpointConfig {
+	return EndpointConfig{
+		Name: dc.Name, DisplayName: dc.DisplayName, Kind: dc.Kind,
+		Addr: dc.Addr, SSHAddr: dc.SSHAddr, User: dc.User,
+		KeyPath: dc.KeyPath, KnownHostsPath: dc.KnownHostsPath,
+		WebUIAddr: dc.WebUIAddr,
+	}
 }
 
 // Run starts the supervisor and gateway. It blocks until ctx is

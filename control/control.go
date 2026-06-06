@@ -24,12 +24,35 @@ import (
 
 // Active is the state the tray publishes and the WebView reads.
 type Active struct {
-	Name    string `json:"name"`
-	// Label is the operator-facing display name (cfg.endpoint.display_name)
-	// when set, otherwise = Name. The Topbar chip + menubar title read
-	// this so the visible text honours per-DC nicknames.
-	Label   string `json:"label,omitempty"`
-	AllDown bool   `json:"allDown"`
+	Name string `json:"name"` // technical DC name
+	// Label is the operator-facing DC display name
+	// (cfg.cluster.dc.display_name when set, else Name).
+	Label string `json:"label,omitempty"`
+	// Cluster is the technical parent-cluster name ; "" in legacy
+	// single-endpoint mode.
+	Cluster string `json:"cluster,omitempty"`
+	// ClusterLabel is the parent cluster's display name ; "" => use
+	// Cluster.
+	ClusterLabel string `json:"cluster_label,omitempty"`
+	AllDown      bool   `json:"allDown"`
+}
+
+// FullLabel composes "Cluster · DC" (with the right labels) when the
+// endpoint carries a cluster, otherwise just the DC label. The
+// dashboard seeds the Topbar chip with this string.
+func (a Active) FullLabel() string {
+	cl := a.ClusterLabel
+	if cl == "" {
+		cl = a.Cluster
+	}
+	dc := a.Label
+	if dc == "" {
+		dc = a.Name
+	}
+	if cl == "" {
+		return dc
+	}
+	return cl + " · " + dc
 }
 
 // Server holds the latest active-DC state behind a loopback HTTP server.
@@ -48,7 +71,13 @@ func (s *Server) Publish(sw failover.Switch) {
 	if label == "" {
 		label = sw.ToName
 	}
-	s.current = Active{Name: sw.ToName, Label: label, AllDown: sw.AllDown}
+	s.current = Active{
+		Name:         sw.ToName,
+		Label:        label,
+		Cluster:      sw.ToCluster,
+		ClusterLabel: sw.ToClusterLabel,
+		AllDown:      sw.AllDown,
+	}
 	s.mu.Unlock()
 }
 

@@ -59,6 +59,15 @@ type Switch struct {
 	// configured.
 	FromLabel string
 	ToLabel   string
+	// FromCluster / ToCluster carry the technical parent-cluster name
+	// for the friendly "Cluster · DC" rendering. Empty in legacy
+	// single-cluster mode.
+	FromCluster string
+	ToCluster   string
+	// FromClusterLabel / ToClusterLabel are the cluster display
+	// names (cluster.display_name when set, else cluster.name).
+	FromClusterLabel string
+	ToClusterLabel   string
 	// AllDown is true when no DC is healthy; ToName is then empty and the
 	// Gateway should surface the "all datacenters unreachable" state.
 	AllDown bool
@@ -143,11 +152,13 @@ func (s *Supervisor) Snapshot() []EndpointStatus {
 	out := make([]EndpointStatus, len(s.eps))
 	for i, e := range s.eps {
 		out[i] = EndpointStatus{
-			Name:        e.ep.Name,
-			DisplayName: e.ep.DisplayName,
-			Target:      e.ep.Backend.Target(),
-			Health:      e.health,
-			Active:      i == s.active,
+			Name:         e.ep.Name,
+			DisplayName:  e.ep.DisplayName,
+			Cluster:      e.ep.Cluster,
+			ClusterLabel: e.ep.ClusterLabel,
+			Target:       e.ep.Backend.Target(),
+			Health:       e.health,
+			Active:       i == s.active,
 		}
 	}
 	return out
@@ -155,20 +166,41 @@ func (s *Supervisor) Snapshot() []EndpointStatus {
 
 // EndpointStatus is a read-only view of one endpoint's standing.
 type EndpointStatus struct {
-	Name        string
-	DisplayName string // operator-facing label ; empty = use Name
-	Target      string
-	Health      Health
-	Active      bool
+	Name         string
+	DisplayName  string // operator-facing DC label ; empty = use Name
+	Cluster      string // parent cluster technical name ; "" in legacy mode
+	ClusterLabel string // parent cluster display label ; "" => use Cluster
+	Target       string
+	Health       Health
+	Active       bool
 }
 
-// Label returns the operator-facing name : DisplayName when set,
+// Label returns the operator-facing DC name : DisplayName when set,
 // Name otherwise.
 func (e EndpointStatus) Label() string {
 	if e.DisplayName != "" {
 		return e.DisplayName
 	}
 	return e.Name
+}
+
+// ClusterLabelOrName returns the cluster's display name when set, the
+// technical cluster name otherwise. Empty in legacy single-cluster mode.
+func (e EndpointStatus) ClusterLabelOrName() string {
+	if e.ClusterLabel != "" {
+		return e.ClusterLabel
+	}
+	return e.Cluster
+}
+
+// FullLabel composes "Cluster · DC" when a cluster name is present,
+// otherwise just the DC label. The menubar title + Topbar chip use it.
+func (e EndpointStatus) FullLabel() string {
+	cl := e.ClusterLabelOrName()
+	if cl == "" {
+		return e.Label()
+	}
+	return cl + " · " + e.Label()
 }
 
 // Run probes on a ticker until ctx is cancelled. It runs one round
@@ -223,13 +255,15 @@ func (s *Supervisor) round(ctx context.Context) {
 			e.upSince = time.Time{}
 		}
 	}
-	from, to, fromLabel, toLabel, changed, allDown := s.reselectLocked(now)
+	from, to, fromLabel, toLabel, fromCluster, toCluster, fromClusterLabel, toClusterLabel, changed, allDown := s.reselectLocked(now)
 	s.mu.Unlock()
 
 	if changed && s.opts.OnSwitch != nil {
 		s.opts.OnSwitch(Switch{
 			FromName: from, ToName: to,
 			FromLabel: fromLabel, ToLabel: toLabel,
+			FromCluster: fromCluster, ToCluster: toCluster,
+			FromClusterLabel: fromClusterLabel, ToClusterLabel: toClusterLabel,
 			AllDown: allDown,
 		})
 	}
@@ -245,7 +279,7 @@ func (s *Supervisor) round(ctx context.Context) {
 // the active DC is down (or there is none yet — cold start, or recovery
 // from all-down), any healthy DC is taken immediately, highest priority
 // first. So we fail over fast and fail back slow.
-func (s *Supervisor) reselectLocked(now time.Time) (from, to, fromLabel, toLabel string, changed, allDown bool) {
+func (s *Supervisor) reselectLocked(now time.Time) (from, to, fromLabel, toLabel, fromCluster, toCluster, fromClusterLabel, toClusterLabel string, changed, allDown bool) {
 	prev := s.active
 	activeHealthy := prev >= 0 && s.eps[prev].healthy
 
@@ -272,19 +306,23 @@ func (s *Supervisor) reselectLocked(now time.Time) (from, to, fromLabel, toLabel
 	}
 
 	if best == prev {
-		return "", "", "", "", false, s.active < 0
+		return "", "", "", "", "", "", "", "", false, s.active < 0
 	}
 
-	prevName, prevLabel := "", ""
+	var prevName, prevLabel, prevCluster, prevClusterLabel string
 	if prev >= 0 {
-		prevName = s.eps[prev].ep.Name
-		prevLabel = s.eps[prev].ep.Label()
+		ep := s.eps[prev].ep
+		prevName = ep.Name
+		prevLabel = ep.Label()
+		prevCluster = ep.Cluster
+		prevClusterLabel = ep.ClusterLabel
 	}
 	s.active = best
 	if best < 0 {
 		s.allDown = true
-		return prevName, "", prevLabel, "", true, true
+		return prevName, "", prevLabel, "", prevCluster, "", prevClusterLabel, "", true, true
 	}
 	s.allDown = false
-	return prevName, s.eps[best].ep.Name, prevLabel, s.eps[best].ep.Label(), true, false
+	ep := s.eps[best].ep
+	return prevName, ep.Name, prevLabel, ep.Label(), prevCluster, ep.Cluster, prevClusterLabel, ep.ClusterLabel, true, false
 }

@@ -28,6 +28,17 @@ type Endpoint struct {
 	// DisplayName is the operator-facing label (Topbar chip, menubar
 	// title, tray submenu). Empty = fall back to Name.
 	DisplayName string
+	// Cluster is the parent cluster's technical name ("paris", "tokyo")
+	// — empty when the legacy single-cluster shape is in use. Threaded
+	// to the supervisor's EndpointStatus + the control server's Active
+	// state so the menubar can render "Paris · salle-jaurès" instead of
+	// just "salle-jaurès". Failover today is flat across all DCs of all
+	// clusters ; per-cluster failover (federation, not failover, across
+	// clusters) is a documented follow-up.
+	Cluster string
+	// ClusterLabel mirrors Cluster but with the cluster's DisplayName
+	// applied. Empty = fall back to Cluster.
+	ClusterLabel string
 	// Backend is the transport used to reach this DC's webui.
 	Backend Backend
 }
@@ -40,6 +51,27 @@ func (e Endpoint) Label() string {
 		return e.DisplayName
 	}
 	return e.Name
+}
+
+// ClusterLabelOrName returns the cluster's display name when set,
+// the technical Cluster name otherwise. Empty when the endpoint
+// was loaded from the legacy endpoints[] shape.
+func (e Endpoint) ClusterLabelOrName() string {
+	if e.ClusterLabel != "" {
+		return e.ClusterLabel
+	}
+	return e.Cluster
+}
+
+// FullLabel composes the cluster + DC label : "Paris · salle-jaurès"
+// when both are present, just the DC label when no cluster is set
+// (legacy shape).
+func (e Endpoint) FullLabel() string {
+	cl := e.ClusterLabelOrName()
+	if cl == "" {
+		return e.Label()
+	}
+	return cl + " · " + e.Label()
 }
 
 // Backend reaches a single datacenter's weft-webui.
