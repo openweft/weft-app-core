@@ -309,6 +309,25 @@ func (s *Shell) Run(ctx context.Context) error {
 // URL is the stable loopback origin to load in the WebView.
 func (s *Shell) URL() string { return s.gw.URL() }
 
+// SwitchCluster scopes failover to the named cluster's DCs only —
+// every endpoint outside the cluster is quarantined so the supervisor
+// can't pick one. Tray's "Switch cluster" menu calls this. Pass "" to
+// clear the filter and restore the legacy flat pool behaviour.
+//
+// The supervisor emits an OnSwitch when this changes the active DC,
+// so the dashboard's Topbar chip + the menubar title update via the
+// usual webinject.FailoverNotice path.
+func (s *Shell) SwitchCluster(cluster string) { s.sup.SetClusterFilter(cluster) }
+
+// ActiveCluster returns the cluster name the currently-selected DC
+// belongs to. Empty when nothing is reachable or in legacy
+// single-cluster mode.
+func (s *Shell) ActiveCluster() string { return s.sup.ActiveCluster() }
+
+// Clusters returns the unique cluster names from the configuration,
+// in declaration order. Tray uses it to populate "Switch cluster".
+func (s *Shell) Clusters() []string { return s.sup.Clusters() }
+
 // InitScript is the document-start JS to inject into the WebView: it
 // tells the SPA about the (single, stable) gateway origin so its API
 // client comes up failover-aware. When AuthToken is set on Options,

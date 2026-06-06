@@ -110,6 +110,11 @@ type epState struct {
 	health  Health
 	healthy bool      // last probe result
 	upSince time.Time // when it most recently transitioned to healthy
+	// disabled = excluded from selection (still probed so the tray's
+	// health glyphs stay accurate). Used by SetClusterFilter to scope
+	// failover to the active cluster's DCs only — switching to another
+	// cluster is operator-driven, never a probe-triggered failover.
+	disabled bool
 }
 
 // Supervisor selects a healthy DC from an ordered endpoint list.
@@ -142,6 +147,63 @@ func (s *Supervisor) Active() (transport.Endpoint, bool) {
 		return transport.Endpoint{}, false
 	}
 	return s.eps[s.active].ep, true
+}
+
+// ActiveCluster returns the technical name of the cluster the
+// currently-active DC belongs to. Empty when nothing is active or in
+// legacy single-cluster mode.
+func (s *Supervisor) ActiveCluster() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.active < 0 {
+		return ""
+	}
+	return s.eps[s.active].ep.Cluster
+}
+
+// Clusters returns the unique cluster names declared across all
+// endpoints, in first-seen order. Tray uses it to populate the
+// "Switch cluster" submenu.
+func (s *Supervisor) Clusters() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	seen := map[string]bool{}
+	out := []string{}
+	for _, e := range s.eps {
+		if e.ep.Cluster != "" && !seen[e.ep.Cluster] {
+			seen[e.ep.Cluster] = true
+			out = append(out, e.ep.Cluster)
+		}
+	}
+	return out
+}
+
+// SetClusterFilter scopes failover to the named cluster's DCs only —
+// every endpoint outside the cluster is marked disabled so the probe
+// loop's reselectLocked skips it. Passing "" clears the filter (every
+// DC is eligible again — the legacy flat behaviour).
+//
+// The call triggers an immediate reselect ; if the previously-active
+// DC was in another cluster, this returns a Switch through OnSwitch.
+// Probing of disabled endpoints continues so the tray's health
+// glyphs stay accurate.
+func (s *Supervisor) SetClusterFilter(cluster string) {
+	s.mu.Lock()
+	for _, e := range s.eps {
+		e.disabled = cluster != "" && e.ep.Cluster != cluster
+	}
+	now := s.opts.Now()
+	from, to, fromLabel, toLabel, fromCluster, toCluster, fromClusterLabel, toClusterLabel, changed, allDown := s.reselectLocked(now)
+	s.mu.Unlock()
+	if changed && s.opts.OnSwitch != nil {
+		s.opts.OnSwitch(Switch{
+			FromName: from, ToName: to,
+			FromLabel: fromLabel, ToLabel: toLabel,
+			FromCluster: fromCluster, ToCluster: toCluster,
+			FromClusterLabel: fromClusterLabel, ToClusterLabel: toClusterLabel,
+			AllDown: allDown,
+		})
+	}
 }
 
 // Snapshot reports each endpoint's name and health, in priority order.
@@ -281,11 +343,17 @@ func (s *Supervisor) round(ctx context.Context) {
 // first. So we fail over fast and fail back slow.
 func (s *Supervisor) reselectLocked(now time.Time) (from, to, fromLabel, toLabel, fromCluster, toCluster, fromClusterLabel, toClusterLabel string, changed, allDown bool) {
 	prev := s.active
-	activeHealthy := prev >= 0 && s.eps[prev].healthy
+	// A disabled active counts as not-healthy : SetClusterFilter
+	// disabling the current pick must force a fresh selection in
+	// whatever DCs remain eligible.
+	activeHealthy := prev >= 0 && s.eps[prev].healthy && !s.eps[prev].disabled
 
 	best := -1
 	for i := range s.eps {
 		e := s.eps[i]
+		if e.disabled {
+			continue // belongs to a non-active cluster, never selectable
+		}
 		if !e.healthy {
 			continue
 		}
