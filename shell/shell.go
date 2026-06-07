@@ -230,6 +230,12 @@ type Options struct {
 	// same-origin API call. Empty = no auth header injected (current
 	// dev / SSH-tunnel-only behaviour).
 	AuthToken string
+	// SSHPassphrase, if non-nil, is called whenever an SSH endpoint's
+	// private key is passphrase-protected. Returns the passphrase bytes
+	// that decrypt the key. Platform implementations (weft-app-osx)
+	// wrap macOS Keychain ; absent means "fail on encrypted keys" with
+	// a clear error message pointing at `--store-ssh-passphrase`.
+	SSHPassphrase transport.PassphraseFunc
 }
 
 // Shell holds a running supervisor + gateway.
@@ -367,7 +373,7 @@ func buildBackend(ec EndpointConfig, opts Options) (transport.Backend, error) {
 		if ec.SSHAddr == "" || ec.WebUIAddr == "" {
 			return nil, fmt.Errorf("ssh transport needs ssh_addr and webui_addr")
 		}
-		signer, err := transport.LoadSigner(ec.KeyPath)
+		signer, err := transport.LoadSignerWithPassphrase(ec.KeyPath, opts.SSHPassphrase)
 		if err != nil {
 			return nil, err
 		}

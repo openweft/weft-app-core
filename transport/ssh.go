@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -136,15 +137,52 @@ func (s *SSHForward) Close() error {
 }
 
 // LoadSigner reads a PEM private key from path and returns an ssh.Signer.
-// A convenience for callers wiring up SSHForward.Signer.
+// Equivalent to LoadSignerWithPassphrase(path, nil) — convenience for
+// callers who know the key is unencrypted.
 func LoadSigner(path string) (ssh.Signer, error) {
+	return LoadSignerWithPassphrase(path, nil)
+}
+
+// PassphraseFunc returns the passphrase that decrypts the private key
+// at the given path. Called only when the key is encrypted ; nil means
+// "no source available", which surfaces *ssh.PassphraseMissingError to
+// the caller as before.
+//
+// The intended platform implementation (weft-app-osx) looks the
+// passphrase up in macOS Keychain (service=weft-ssh-passphrase,
+// account=<canonical key path>), gated by the system's standard
+// authentication UI. The caller can pre-stage the entry via the
+// app's `--store-ssh-passphrase <path>` flag.
+type PassphraseFunc func(keyPath string) ([]byte, error)
+
+// LoadSignerWithPassphrase reads a PEM private key from path. If the
+// key is encrypted, passphraseFn is called to obtain the passphrase ;
+// passing nil means "fail on encrypted keys" (the legacy LoadSigner
+// behaviour).
+func LoadSignerWithPassphrase(path string, passphraseFn PassphraseFunc) (ssh.Signer, error) {
 	pem, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read ssh key %s: %w", path, err)
 	}
 	signer, err := ssh.ParsePrivateKey(pem)
-	if err != nil {
+	if err == nil {
+		return signer, nil
+	}
+	// Encrypted key — try the passphrase source.
+	var missing *ssh.PassphraseMissingError
+	if !errors.As(err, &missing) {
 		return nil, fmt.Errorf("parse ssh key %s: %w", path, err)
+	}
+	if passphraseFn == nil {
+		return nil, fmt.Errorf("ssh key %s is passphrase-protected ; no passphrase source configured (use `weft-app-osx --store-ssh-passphrase %s` to cache one in Keychain)", path, path)
+	}
+	passphrase, err := passphraseFn(path)
+	if err != nil {
+		return nil, fmt.Errorf("get passphrase for %s: %w", path, err)
+	}
+	signer, err = ssh.ParsePrivateKeyWithPassphrase(pem, passphrase)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt ssh key %s: %w", path, err)
 	}
 	return signer, nil
 }
