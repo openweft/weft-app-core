@@ -68,6 +68,12 @@ type DCConfig struct {
 	KeyPath        string `json:"key_path,omitempty"`
 	KnownHostsPath string `json:"known_hosts_path,omitempty"`
 	WebUIAddr      string `json:"webui_addr,omitempty"`
+	// LoomAddr is the SSH-forwarded address of weft-loom-server in
+	// this DC ("host:port"). When set, the shell spawns a second
+	// supervisor + gateway dedicated to loom alongside the primary
+	// webui pair. Empty = loom disabled in this DC ; the primary
+	// webui pipeline is unaffected.
+	LoomAddr string `json:"loom_addr,omitempty"`
 }
 
 // EndpointConfig is the legacy single-DC shape (no cluster grouping).
@@ -88,6 +94,9 @@ type EndpointConfig struct {
 	KeyPath        string `json:"key_path,omitempty"`
 	KnownHostsPath string `json:"known_hosts_path,omitempty"`
 	WebUIAddr      string `json:"webui_addr,omitempty"`
+	// LoomAddr enables the loom secondary supervisor + gateway. Same
+	// semantics as DCConfig.LoomAddr — empty leaves loom off.
+	LoomAddr string `json:"loom_addr,omitempty"`
 }
 
 // Config is the app's connection configuration, typically loaded from
@@ -145,6 +154,7 @@ func (c Config) normalisedClusters() []ClusterConfig {
 			Addr: ep.Addr, SSHAddr: ep.SSHAddr, User: ep.User,
 			KeyPath: ep.KeyPath, KnownHostsPath: ep.KnownHostsPath,
 			WebUIAddr: ep.WebUIAddr,
+			LoomAddr:  ep.LoomAddr,
 		})
 	}
 	if len(c.Clusters) == 0 {
@@ -238,10 +248,16 @@ type Options struct {
 	SSHPassphrase transport.PassphraseFunc
 }
 
-// Shell holds a running supervisor + gateway.
+// Shell holds the running per-service supervisor + gateway pairs.
+// The primary pair (sup/gw) targets weft-webui. The optional loom pair
+// (loomSup/loomGW) targets weft-loom-server ; it's built only when at
+// least one DC in the config carries a LoomAddr. When loom is off, the
+// loom pair fields are nil and LoomURL() returns "".
 type Shell struct {
 	sup       *failover.Supervisor
 	gw        *failover.Gateway
+	loomSup   *failover.Supervisor
+	loomGW    *failover.Gateway
 	authToken string
 }
 
@@ -289,7 +305,74 @@ func New(cfg Config, opts Options) (*Shell, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Shell{sup: sup, gw: gw, authToken: opts.AuthToken}, nil
+
+	// Optional loom secondary pair : every DC that exposes a loom_addr
+	// gets a loom-pointed backend, fed into a sibling supervisor +
+	// gateway. Loopback bind defaults to ":0" (kernel-picked) so it
+	// doesn't collide with the primary gateway. When no DC has
+	// loom_addr the loom pair stays nil — LoomURL() returns "" and
+	// the platform UI suppresses the "Open Loom" menu item.
+	var loomSup *failover.Supervisor
+	var loomGW *failover.Gateway
+	var loomEps []transport.Endpoint
+	for _, cl := range clusters {
+		clusterLabel := cl.DisplayName
+		if clusterLabel == "" {
+			clusterLabel = cl.Name
+		}
+		for _, dc := range cl.DCs {
+			if dc.LoomAddr == "" {
+				continue
+			}
+			lb, err := buildBackend(dcToLegacyLoom(dc), opts)
+			if err != nil {
+				return nil, fmt.Errorf("loom : cluster %q dc %q: %w", cl.Name, dc.Name, err)
+			}
+			loomEps = append(loomEps, transport.Endpoint{
+				Name:         dc.Name,
+				DisplayName:  dc.DisplayName,
+				Cluster:      cl.Name,
+				ClusterLabel: clusterLabel,
+				Backend:      lb,
+			})
+		}
+	}
+	if len(loomEps) > 0 {
+		loomSup = failover.New(loomEps, failover.Options{
+			Interval: cfg.Interval,
+			HoldDown: cfg.HoldDown,
+			// No OnSwitch on the loom pair — the primary already
+			// notifies the SPA ; loom failover is silent from the UI's
+			// perspective (the WebView origin doesn't change).
+		})
+		var lerr error
+		loomGW, lerr = failover.NewGateway(loomSup, "")
+		if lerr != nil {
+			return nil, fmt.Errorf("loom gateway: %w", lerr)
+		}
+	}
+
+	return &Shell{
+		sup:       sup,
+		gw:        gw,
+		loomSup:   loomSup,
+		loomGW:    loomGW,
+		authToken: opts.AuthToken,
+	}, nil
+}
+
+// dcToLegacyLoom is the loom counterpart of dcToLegacy : it swaps
+// LoomAddr in for WebUIAddr so buildBackend's SSHForward path targets
+// the loom listener instead of the webui one. All other fields
+// (transport, ssh, key) are shared with the primary endpoint — both
+// services live on the same host, reached through the same key.
+func dcToLegacyLoom(dc DCConfig) EndpointConfig {
+	return EndpointConfig{
+		Name: dc.Name, DisplayName: dc.DisplayName, Kind: dc.Kind,
+		Addr: dc.LoomAddr, SSHAddr: dc.SSHAddr, User: dc.User,
+		KeyPath: dc.KeyPath, KnownHostsPath: dc.KnownHostsPath,
+		WebUIAddr: dc.LoomAddr,
+	}
 }
 
 // dcToLegacy converts the new DCConfig to the legacy EndpointConfig
@@ -307,13 +390,40 @@ func dcToLegacy(dc DCConfig) EndpointConfig {
 // Run starts the supervisor and gateway. It blocks until ctx is
 // cancelled, then tears both down. Run it in its own goroutine; the
 // main thread belongs to the platform UI loop.
+//
+// When loom is enabled, the loom supervisor + gateway are started in
+// background goroutines bound to the same ctx ; their lifetime is
+// always a strict subset of the primary pair's.
 func (s *Shell) Run(ctx context.Context) error {
 	go s.sup.Run(ctx)
+	if s.loomSup != nil {
+		go s.loomSup.Run(ctx)
+	}
+	if s.loomGW != nil {
+		go func() {
+			if err := s.loomGW.Serve(ctx); err != nil {
+				// Match the primary gateway's error policy : log via
+				// the platform's caller, don't kill the process.
+				_ = err
+			}
+		}()
+	}
 	return s.gw.Serve(ctx) // returns nil on ctx cancel / Close
 }
 
 // URL is the stable loopback origin to load in the WebView.
 func (s *Shell) URL() string { return s.gw.URL() }
+
+// LoomURL returns the loopback origin for the loom secondary gateway,
+// or "" when loom is disabled (no DC in the config exposes loom_addr).
+// The platform's tray uses this to decide whether to surface an
+// "Open Loom" menu item.
+func (s *Shell) LoomURL() string {
+	if s.loomGW == nil {
+		return ""
+	}
+	return s.loomGW.URL()
+}
 
 // SwitchCluster scopes failover to the named cluster's DCs only —
 // every endpoint outside the cluster is quarantined so the supervisor
