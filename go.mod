@@ -2,6 +2,6 @@ module github.com/openweft/weft-app-core
 
 go 1.27.1
 
-require golang.org/x/crypto v0.52.0
+require golang.org/x/crypto v0.56.0
 
-require golang.org/x/sys v0.45.0 // indirect
+require golang.org/x/sys v0.47.0 // indirect
